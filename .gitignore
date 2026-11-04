@@ -1,0 +1,24 @@
+## envionmnt
+.env
+venv/
+
+
+.history
+.Rproj.user
+
+# Microsoft Office temp files
+~$*
+
+# Latex
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+
+# R studio
+*.Rhistory
+*.RData
+
+# python
+*.pyc
