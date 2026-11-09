@@ -1,180 +1,222 @@
-# Category == "TIS", whether the model find exact start: Exact accuracy, mean absolute error, detection rate
-# positive = "TIS" + "CDS", negative = "5/3UTR". Accuracy, precision, recall, f1 score
-# How many ORFs are detected in 4 regions: 5'UTR, CDS, 3'UTR, TIS
-
+"""Run evaluation for the 110 annotated genes; edit paths here as needed."""
+from pathlib import Path
 import pandas as pd
-import numpy as np
-
-# -----------------------------
-# 1. Load data
-# -----------------------------
-benchmark = pd.read_csv("/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/Benchmark/benchmark_100nt.tsv", sep="\t")
-pred = pd.read_csv("/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Benchmark/candidate_orfs_benchmarkset.txt", sep="\t")
-
-# -----------------------------
-# 2. Parse IDs and truth
-# -----------------------------
-pred["fragment_id"] = pred["Gene"].str.split("|", regex=False).str[0] # ex. F00001
-pred["pred_region"] = pred["Gene"].str.split("|", regex=False).str[-1] # ex. 5UTR, CDS, 3UTR, TIS
-
-# true TIS position inside fragment (1-based nt)
-benchmark["true_tis_nt"] = benchmark["cds_start"] - benchmark["start"] + 1
-
-# true label for binary classification; 1 = positive = TIS or CDS, 0 = negative = 5UTR or 3UTR
-benchmark["true_label"] = benchmark["category"].map(
-    lambda x: 1 if x in ("TIS", "CDS") else 0
+from evaluate_metrics import (
+    normalize_orfs, evaluate_orfs, frame_classification_metrics, format_report
 )
 
-# predicted start nucleotide from k_start
-pred["pred_start_nt"] = pred["k_start"] + 12
 
-# merge predictions with benchmark
-merged = pred.merge(
-    benchmark,
-    on="fragment_id",
+PRED_FILE = Path('/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Benchmark/candidate_orfs_benchmarkset.txt')
+REF_FILE = Path('/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/Benchmark/benchmark_100nt_ref.tsv')
+OUT = Path('/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Benchmark/Evaluation')
+
+OFFSET_NT = 12
+
+print('Loading data...')
+pred_ORF = pd.read_csv(PRED_FILE, sep='\t')
+ref_ORF = pd.read_csv(REF_FILE, sep=r'\s+')
+
+# Check that the prediction file has a frame column
+if 'frame' not in pred_ORF.columns:
+    raise ValueError('Prediction file must include frame (0, 1, 2)')
+print('Prediction ORFs:\n', pred_ORF.head())
+print('Reference ORFs:\n', ref_ORF.head())
+
+# 1. Normalize the ORFs to have the same column names and formats
+ref = normalize_orfs(ref_ORF, 'gene_name', 'cds_start_kmer', 'cds_end_kmer', 'ref')
+pred = normalize_orfs(pred_ORF, 'Gene', 'k_start', 'k_end', 'pred', frame_col='frame')
+
+print('Unknown predicted genes:', sorted(set(pred.gene_name) - set(ref.gene_name)))
+print('Reference genes without predictions:', sorted(set(ref.gene_name) - set(pred.gene_name)))
+
+# 2. Evaluate the predictions against the reference
+all_candidates, selected, metrics = evaluate_orfs(ref, pred, offset_nt=OFFSET_NT)
+frame_table, _ = frame_classification_metrics(selected)
+
+
+# 3. Save the results
+OUT.mkdir(parents=True, exist_ok=True)
+all_candidates.to_csv(OUT / 'all_candidate_scores.tsv', sep='\t', index=False)
+selected.to_csv(OUT / 'selected_orfs.tsv', sep='\t', index=False)
+if not frame_table.empty:
+    frame_table.to_csv(OUT / 'frame_metrics.tsv', sep='\t', index=False)
+pd.DataFrame(list(metrics.items()), columns=['metric', 'value']).to_csv(
+    OUT / 'evaluation_metrics.tsv', sep='\t', index=False
+)
+report = format_report(metrics)
+(OUT / 'evaluation_report.txt').write_text(report, encoding='utf-8')
+print(report)
+print('Saved to:', OUT)
+
+
+# ============================================================
+# Positive vs Negative benchmark evaluation
+# ============================================================
+
+print("\n========== Positive / Negative Evaluation ==========")
+
+# 1. All reference fragments
+group_eval = ref_ORF[["gene_name", "category", "label"]].copy()    # ex. f000001  TIS Positive
+group_eval = group_eval.drop_duplicates(subset="gene_name")
+
+# 2. Whether the model predicted at least one ORF
+detected_ids = set(pred_ORF["Gene"].dropna())
+group_eval["detected"] = group_eval["gene_name"].isin(detected_ids)
+
+# 3. Add evaluation metrics of selected ORFs
+metric_cols = [
+    "gene_name",
+    "frame_correct",
+    "start_exact",
+    "stop_exact",
+    "exact_match",
+    "iou",
+    "start_abs_error",
+    "stop_abs_error"
+]
+
+available_cols = [
+    col for col in metric_cols
+    if col in selected.columns
+]
+
+group_eval = group_eval.merge(
+    selected[available_cols],
+    on="gene_name",
     how="left",
-    validate="many_to_one"
+    validate="one_to_one"
 )
 
-# -----------------------------
-# 3. Region-level detection rate
-# -----------------------------
-detected_frags = set(pred["fragment_id"].unique())
+# 4. Positive and negative groups
+positive = group_eval[group_eval["label"] == "positive"].copy()
+negative = group_eval[group_eval["label"] == "negative"].copy()
 
-benchmark["detected"] = benchmark["fragment_id"].isin(detected_frags)
+summary = group_eval.groupby("label").agg(
+    n_total=("gene_name", "size"),
+    n_detected=("detected", "sum"))
 
-region_summary = (
-    benchmark.groupby("category")
-    .agg(
-        n_total=("fragment_id", "size"),
-        n_detected=("detected", "sum")
-    )
-    .reset_index()
-)
+summary["n_undetected"] = (summary["n_total"] - summary["n_detected"])
+summary["detection_rate"] = (summary["n_detected"] / summary["n_total"])
 
-region_summary["detection_rate"] = (
-    region_summary["n_detected"] / region_summary["n_total"]
-)
+print("\n--- Detection by group ---")
+print(summary)
 
-print("\n=== Detection rate by region ===")
-print(region_summary)
+# ============================================================
+# Binary classification
+# ============================================================
 
-# -----------------------------
-# 4. Fragment-level binary classification
-#    predicted positive = at least one candidate
-# -----------------------------
-frag_pred = (
-    benchmark[["fragment_id", "category", "true_label"]]
-    .copy()
-)
+TP = int(positive["detected"].sum())
+FN = int((~positive["detected"]).sum())
 
-frag_pred["pred_label"] = frag_pred["fragment_id"].isin(detected_frags).astype(int)
+FP = int(negative["detected"].sum())
+TN = int((~negative["detected"]).sum())
 
-TP = ((frag_pred["true_label"] == 1) & (frag_pred["pred_label"] == 1)).sum()
-TN = ((frag_pred["true_label"] == 0) & (frag_pred["pred_label"] == 0)).sum()
-FP = ((frag_pred["true_label"] == 0) & (frag_pred["pred_label"] == 1)).sum()
-FN = ((frag_pred["true_label"] == 1) & (frag_pred["pred_label"] == 0)).sum()
+accuracy = (TP + TN) / (TP + TN + FP + FN)
+precision = (TP / (TP + FP) if TP + FP > 0 else 0)
+recall = ( TP / (TP + FN) if TP + FN > 0 else 0)
+specificity = (TN / (TN + FP) if TN + FP > 0 else 0)
+f1 = (2 * TP / (2 * TP + FP + FN) if 2 * TP + FP + FN > 0 else 0)
 
-accuracy = (TP + TN) / len(frag_pred)
-precision = TP / (TP + FP) if (TP + FP) > 0 else np.nan
-recall = TP / (TP + FN) if (TP + FN) > 0 else np.nan
-specificity = TN / (TN + FP) if (TN + FP) > 0 else np.nan
-f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else np.nan
-balanced_acc = (recall + specificity) / 2
+print("\n--- Binary classification ---")
+print(f"TP: {TP}, FP: {FP}, TN: {TN}, FN: {FN}")
+print(f"Accuracy:    {accuracy:.4f}")
+print(f"Precision:   {precision:.4f}")
+print(f"Recall:      {recall:.4f}")
+print(f"Specificity: {specificity:.4f}")
+print(f"F1-score:   {f1:.4f}")
 
-print("\n=== Fragment-level binary classification ===")
-print(f"TP={TP}, TN={TN}, FP={FP}, FN={FN}")
-print(f"Accuracy          : {accuracy:.4f}")
-print(f"Precision         : {precision:.4f}")
-print(f"Recall (Sensitivity): {recall:.4f}")
-print(f"Specificity       : {specificity:.4f}")
-print(f"F1-score          : {f1:.4f}")
-print(f"Balanced accuracy : {balanced_acc:.4f}")
+# ============================================================
+# Positive group: ORF prediction quality
+# ============================================================
 
-# -----------------------------
-# 5. TIS localization: ANY-HIT rule
-# -----------------------------
-tis_truth = benchmark[benchmark["category"] == "TIS"].copy()
+print("\n--- Positive ORF quality ---")
 
-tis_pred = merged[merged["category"] == "TIS"].copy()
+positive_metrics = {
+    "n_total": len(positive),
+    "n_detected": int(positive["detected"].sum()),
+    "detection_rate": positive["detected"].mean(),
+    "n_frame_correct": int(positive["frame_correct"].fillna(False).sum()),
+    "n_start_exact": int(positive["start_exact"].fillna(False).sum()),
+    "n_stop_exact": int(positive["stop_exact"].fillna(False).sum()),
+    "n_exact_cds": int(positive["exact_match"].fillna(False).sum()),
+    "mean_iou": positive["iou"].fillna(0).mean(),
+    "start_mae_detected": positive["start_abs_error"].mean(),
+    "stop_mae_detected": positive["stop_abs_error"].mean()
+}
 
-# Calculate nucleotide position error
-tis_pred["start_error"] = (
-    tis_pred["pred_start_nt"] - tis_pred["true_tis_nt"]
-)
+positive_metrics["frame_accuracy"] = (positive_metrics["n_frame_correct"] / positive["detected"].sum())
+positive_metrics["exact_cds_recovery"] = (positive_metrics["n_exact_cds"] / positive["detected"].sum())
 
-tis_pred["abs_error"] = tis_pred["start_error"].abs()
+for key, value in positive_metrics.items():
+    print(f"{key:25s}: {value:.4f}")
 
-# For each fragment, choose the candidate closest to true TIS
-anyhit = (
-    tis_pred.groupby("fragment_id")
-    .agg(
-        exact_hit=("abs_error", lambda x: (x == 0).any()),
-        best_abs_error=("abs_error", "min"),
-        n_candidates=("fragment_id", "size")
-    )
-    .reset_index()
-)
+# ============================================================
+# Negative group: False-positive detection
+# ============================================================
 
-# Include fragments without predictions
-anyhit = tis_truth[["fragment_id"]].merge(
-    anyhit,
-    on="fragment_id",
-    how="left"
-)
+print("\n--- Negative ORF detection ---")
 
-anyhit["exact_hit"] = anyhit["exact_hit"].fillna(False)
-anyhit["n_candidates"] = anyhit["n_candidates"].fillna(0)
-anyhit["detected"] = anyhit["n_candidates"] > 0
+negative_metrics = {
+    "n_total": len(negative),
+    "n_false_positive": int(negative["detected"].sum()),
+    "n_true_negative": int((~negative["detected"]).sum()),
+    "false_positive_rate": negative["detected"].mean(),
+    "specificity": (~negative["detected"]).mean()
+}
 
-# Mean absolute nucleotide error
-mean_nt_error = anyhit["best_abs_error"].mean()
+for key, value in negative_metrics.items():
+    print(f"{key:25s}: {value:.4f}")
 
-print("\n=== TIS localization (ANY-HIT) ===")
-print(f"Detection rate       : {anyhit['detected'].mean():.4f}")
-print(f"Exact TIS accuracy   : {anyhit['exact_hit'].mean():.4f}")
-print(f"Mean nt error (MAE)  : {mean_nt_error:.2f} nt")
+# ============================================================
+# Save Positive / Negative evaluation report
+# ============================================================
 
-# -----------------------------
-# 6. TIS localization: TOP-1 rule
-#    Keep highest-scoring candidate per fragment
-# -----------------------------
+OUT.mkdir(parents=True, exist_ok=True)
 
-top1 = (
-    tis_pred.sort_values(
-        ["fragment_id", "orf_score"],
-        ascending=[True, False]
-    )
-    .drop_duplicates("fragment_id")
-    .copy()
-)
+# 1. Save fragment-level results
+group_eval.to_csv(OUT / "positive_negative_fragment_results.tsv",sep="\t",index=False)
 
-# Calculate nucleotide position error
-top1["start_error"] = (
-    top1["pred_start_nt"] - top1["true_tis_nt"]
-)
+# 2. Save group detection summary
+summary.to_csv(OUT / "positive_negative_detection_summary.tsv",sep="\t")
 
-top1["abs_error"] = top1["start_error"].abs()
-top1["exact_hit"] = top1["abs_error"] == 0
+# 3. Combine all metrics into one report
+report_lines = [
+    "========== Positive / Negative Evaluation ==========",
+    "",
+    "========== Detection by Group ==========",
+    summary.to_string(),
+    "",
+    "========== Binary Classification ==========",
+    f"TP: {TP}",
+    f"FP: {FP}",
+    f"TN: {TN}",
+    f"FN: {FN}",
+    f"Accuracy:    {accuracy:.4f}",
+    f"Precision:   {precision:.4f}",
+    f"Recall:      {recall:.4f}",
+    f"Specificity: {specificity:.4f}",
+    f"F1-score:   {f1:.4f}",
+    "",
+    "========== Positive ORF Quality ==========",
+]
 
-# Include undetected TIS fragments
-top1 = tis_truth[["fragment_id"]].merge(
-    top1[
-        ["fragment_id", "pred_start_nt",
-         "start_error", "abs_error", "exact_hit"]
-    ],
-    on="fragment_id",
-    how="left"
-)
+for key, value in positive_metrics.items():
+    report_lines.append(f"{key:25s}: {value:.4f}")
 
-top1["detected"] = top1["abs_error"].notna()
-top1["exact_hit"] = top1["exact_hit"].fillna(False)
+report_lines.extend([
+    "",
+    "========== Negative ORF Detection =========="
+])
 
-# Mean absolute nucleotide error
-mean_nt_error = top1["abs_error"].mean()
+for key, value in negative_metrics.items():
+    report_lines.append(f"{key:25s}: {value:.4f}")
 
-print("\n=== TIS localization (TOP-1 by orf_score) ===")
-print(f"Detection rate      : {top1['detected'].mean():.4f}")
-print(f"Exact TIS accuracy  : {top1['exact_hit'].mean():.4f}")
-print(f"Mean nt error (MAE) : {mean_nt_error:.2f} nt")
-# 我需要增加IoU
+report_text = "\n".join(report_lines) + "\n"
+
+# 4. Save one combined report
+with open(OUT / "evaluation_report.txt", "a", encoding="utf-8") as f:
+    f.write("\n\n")
+    f.write(report_text)
+
+print(report_text)
+print("Report saved to:", OUT / "evaluation_report.txt")

@@ -1,8 +1,10 @@
-"""Reusable annotated-CDS versus predicted-ORF evaluation utilities.
+"""Reusable ORF evaluation with frame classification and boundary metrics.
 
-Coordinates are inclusive, and reference and prediction must use the same
-coordinate system. If using k-mer starts at stride one, boundary differences
-have units of nucleotides; segment coverage remains k-mer-position-level.
+Intervals are inclusive k-mer positions. Coordinates must share an origin and
+stride. Boundary errors are nt only when k-mer step is 1 nucleotide.
+
+Selection is reference-guided (min absolute start + end error), an oracle
+benchmark rather than a deployed candidate-ranking metric.
 """
 from __future__ import annotations
 
@@ -11,12 +13,13 @@ import pandas as pd
 
 
 def normalize_orfs(df: pd.DataFrame, gene_col: str, start_col: str,
-                   end_col: str, prefix: str) -> pd.DataFrame:
-    """Normalize endpoints to inclusive [start, end] integer intervals."""
-    cols = [gene_col, start_col, end_col]
-    missing = set(cols) - set(df.columns)
+                   end_col: str, prefix: str, frame_col: str = "frame") -> pd.DataFrame:
+    """Normalize endpoint columns; retain candidate frame for prediction data."""
+    needed = {gene_col, start_col, end_col}
+    missing = needed - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns: {sorted(missing)}")
+
     result = pd.DataFrame({
         "gene_name": df[gene_col].astype("string").str.strip(),
         f"{prefix}_start": pd.to_numeric(df[start_col], errors="raise"),
@@ -24,19 +27,25 @@ def normalize_orfs(df: pd.DataFrame, gene_col: str, start_col: str,
     })
     if result.isna().any().any() or result["gene_name"].eq("").any():
         raise ValueError("Null or empty gene names/coordinates are not allowed")
-    for field in [f"{prefix}_start", f"{prefix}_end"]:
-        if not (result[field] % 1 == 0).all():
-            raise ValueError(f"{field} must contain integer coordinates")
-        result[field] = result[field].astype('int64')
+    for col in (f"{prefix}_start", f"{prefix}_end"):
+        if not (result[col] % 1 == 0).all():
+            raise ValueError(f"{col} must contain integer coordinates")
+        result[col] = result[col].astype("int64")
     a = result[f"{prefix}_start"].copy()
     b = result[f"{prefix}_end"].copy()
     result[f"{prefix}_start"] = np.minimum(a, b)
     result[f"{prefix}_end"] = np.maximum(a, b)
+
+    if prefix == "pred" and frame_col in df.columns:
+        frame = pd.to_numeric(df[frame_col], errors="raise")
+        if frame.isna().any() or not frame.isin((0, 1, 2)).all():
+            raise ValueError("Prediction frame must be 0, 1 or 2")
+        result["pred_frame"] = frame.astype(int)
     return result
 
 
 def score_intervals(df: pd.DataFrame) -> pd.DataFrame:
-    """Score one predicted interval against one reference interval per row."""
+    """Calculate ORF coverage and exact boundary metrics per candidate."""
     result = df.copy()
     p0, p1 = result["pred_start"], result["pred_end"]
     r0, r1 = result["ref_start"], result["ref_end"]
@@ -45,8 +54,10 @@ def score_intervals(df: pd.DataFrame) -> pd.DataFrame:
     result["overlap_len"] = overlap
     result["pred_len"] = pred_len
     result["ref_len"] = ref_len
-    result["precision"] = overlap / pred_len
-    result["recall"] = overlap / ref_len
+    result["coverage_ref"] = overlap / ref_len
+    result["coverage_pred"] = overlap / pred_len
+    result["precision"] = result["coverage_pred"]
+    result["recall"] = result["coverage_ref"]
     result["f1_score"] = 2 * overlap / (pred_len + ref_len)
     result["iou"] = overlap / (pred_len + ref_len - overlap)
     result["start_abs_error"] = (p0 - r0).abs()
@@ -55,76 +66,201 @@ def score_intervals(df: pd.DataFrame) -> pd.DataFrame:
     result["start_exact"] = p0.eq(r0)
     result["stop_exact"] = p1.eq(r1)
     result["exact_match"] = result["start_exact"] & result["stop_exact"]
+    if {"pred_frame", "true_frame"}.issubset(result.columns):
+        result["frame_correct"] = result["pred_frame"].eq(result["true_frame"])
+        #result["strict_orf_correct"] = result["frame_correct"] & result["exact_match"]
     return result
 
 
-def evaluate_orfs(ref: pd.DataFrame, pred: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Select closest ORF per gene and evaluate across every reference gene.
+def frame_classification_metrics(selected: pd.DataFrame):
+    df = selected.dropna(
+        subset=["true_frame", "pred_frame"]
+    ).copy()
 
-    Inputs must contain gene_name/ref_start/ref_end and
-    gene_name/pred_start/pred_end, respectively. A unique reference per gene
-    is required. Selection minimizes |start error| + |end error|, breaking ties
-    by higher IoU, then earlier original prediction order.
-    """
-    if ref['gene_name'].duplicated().any():
-        raise ValueError("Multiple reference ORFs for a gene: use transcript/ORF ID as key")
-    unknown = sorted(set(pred['gene_name']) - set(ref['gene_name']))
-    missing = sorted(set(ref['gene_name']) - set(pred['gene_name']))
-    if unknown:
-        raise ValueError(f"Predicted genes absent from reference: {unknown[:10]}" +
-                         (f" (and {len(unknown)-10} more)" if len(unknown)>10 else ""))
-    scored = score_intervals(pred.merge(ref, on='gene_name', how='left', validate='many_to_one'))
-    scored['_original_order'] = np.arange(len(scored))
-    chosen = (scored.sort_values(
-        ['gene_name', 'boundary_distance', 'iou', '_original_order'],
-        ascending=[True, True, False, True], kind='stable'
-    ).drop_duplicates('gene_name').drop(columns='_original_order'))
-    result = ref.merge(chosen.drop(columns=['ref_start', 'ref_end']),
-                       on='gene_name', how='left', validate='one_to_one')
-    result['detected'] = result['pred_start'].notna()
-    for col in ['start_exact','stop_exact','exact_match']:
-        result[col] = result[col].fillna(False).astype(bool)
-    # Missing predictions have zero region overlap, hence F1/IoU/Recall = 0.
-    for col in ['recall','f1_score','iou']:
-        result[col] = result[col].fillna(0.0)
-    n = len(ref)
-    detected = int(result['detected'].sum())
-    exact = int(result['exact_match'].sum())
+    truth = df["true_frame"]
+    prediction = df["pred_frame"]
+
+    records = []
+
+    for frame in (0, 1, 2):
+        tp = int(((truth == frame) & (prediction == frame)).sum())
+        fp = int(((truth != frame) & (prediction == frame)).sum())
+        fn = int(((truth == frame) & (prediction != frame)).sum())
+        tn = int(((truth != frame) & (prediction != frame)).sum())
+
+        records.append({
+            "frame": frame,
+            "TP": tp,
+            "FP": fp,
+            "FN": fn,
+            "TN": tn,
+            "precision": tp / (tp + fp) if tp + fp else np.nan,
+            "recall": tp / (tp + fn) if tp + fn else np.nan,
+            "accuracy": (tp + tn) / len(df) if len(df) else np.nan,
+        })
+
+    table = pd.DataFrame(records)
+
+    n_correct = int((truth == prediction).sum())
+
     metrics = {
-        'n_reference': n,
-        'n_predicted_genes': pred['gene_name'].nunique(),
-        'n_predicted_orfs': len(pred),
-        'n_missing_predictions': len(missing),
-        'n_detected': detected,
-        'detection_rate': detected/n if n else np.nan,
-        'n_exact_cds': exact,
-        'exact_cds_recovery': exact/n if n else np.nan,
-        'n_start_exact': int(result['start_exact'].sum()),
-        'start_exact_rate': result['start_exact'].mean(),
-        'n_stop_exact': int(result['stop_exact'].sum()),
-        'stop_exact_rate': result['stop_exact'].mean(),
-        # Mean across all reference genes, missing calls have zero overlap.
-        'mean_recall': result['recall'].mean(),
-        'mean_f1': result['f1_score'].mean(),
-        'mean_iou': result['iou'].mean(),
-        # Precision not defined for a gene with no predicted interval.
-        'mean_precision_detected': result['precision'].mean(),
-        # Location error is only defined for detected genes.
-        'start_mae_detected': result['start_abs_error'].mean(),
-        'stop_mae_detected': result['stop_abs_error'].mean(),
+        "n_frame_evaluated": len(df),
+        "n_frame_correct": n_correct,
+        "frame_accuracy": n_correct / len(df) if len(df) else np.nan,
     }
-    return scored.drop(columns='_original_order'), result, metrics
 
+    return table, metrics
+
+
+def evaluate_orfs(ref: pd.DataFrame,pred: pd.DataFrame,offset_nt: int = 12) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Evaluate all candidate ORFs and select one closest
+    ORF per gene/fragment.
+
+    selected contains ONLY genes/fragments with predictions.
+    """
+
+    if ref["gene_name"].duplicated().any():raise ValueError("Multiple reference CDS per gene")
+    unknown = sorted(set(pred["gene_name"]) - set(ref["gene_name"]))
+
+    if unknown:
+        raise ValueError(
+            f"Predicted genes absent from reference: {unknown[:10]}"
+        )
+
+    # --------------------------------------------------
+    # 1. Calculate true reading frame
+    # --------------------------------------------------
+
+    reference = ref.copy()
+    reference["true_frame"] = ((reference["ref_start"] - 1 + offset_nt) % 3).astype(int)
+    
+    # --------------------------------------------------
+    # 2. Score all candidate ORFs
+    # --------------------------------------------------
+
+    scored = score_intervals(
+        pred.merge(
+            reference,
+            on="gene_name",
+            how="left",
+            validate="many_to_one"
+        )
+    )
+
+    scored["_original_order"] = np.arange(len(scored))
+
+    # --------------------------------------------------
+    # 3. Select closest candidate for each fragment
+    # --------------------------------------------------
+
+    selected = (
+        scored.sort_values(
+            [
+                "gene_name",
+                "boundary_distance",
+                "iou",
+                "_original_order"
+            ],
+            ascending=[True, True, False, True],
+            kind="stable"
+        ).drop_duplicates("gene_name").drop(columns="_original_order").reset_index(drop=True))
+
+    # selected ONLY contains predicted ORFs
+
+    # --------------------------------------------------
+    # 4. Detection statistics
+    # --------------------------------------------------
+
+    n_reference = len(reference)
+    n_detected = len(selected)
+    n_undetected = n_reference - n_detected
+
+    detection_rate = (
+        n_detected / n_reference
+        if n_reference else np.nan
+    )
+
+    # --------------------------------------------------
+    # 5. ORF evaluation metrics
+    # --------------------------------------------------
+
+    metrics = {
+        "n_reference": n_reference,
+        "n_detected": n_detected,
+        "n_undetected": n_undetected,
+        "detection_rate": detection_rate,
+
+        #"n_exact_cds": int(selected["exact_match"].sum()),
+        #"n_start_exact": int(selected["start_exact"].sum()),
+        #"n_stop_exact": int(selected["stop_exact"].sum()),
+
+        "mean_precision_detected": selected["precision"].mean(),
+        "mean_recall_detected": selected["recall"].mean(),
+        "mean_f1_detected": selected["f1_score"].mean(),
+        "mean_iou_detected": selected["iou"].mean(),
+
+        "start_mae_detected": selected["start_abs_error"].mean(),
+        "stop_mae_detected": selected["stop_abs_error"].mean(),
+    }
+
+    # Exact-match rates among selected predictions
+    metrics["start_exact_rate_detected"] = (
+        selected["start_exact"].mean()
+    )
+
+    metrics["stop_exact_rate_detected"] = (
+        selected["stop_exact"].mean()
+    )
+
+    metrics["exact_cds_rate_detected"] = (
+        selected["exact_match"].mean()
+    )
+
+    # --------------------------------------------------
+    # 6. Frame classification
+    # --------------------------------------------------
+
+    if "pred_frame" in selected.columns:
+
+        frame_table, frame_metrics = (
+            frame_classification_metrics(selected)
+        )
+
+        metrics.update(frame_metrics)
+
+        #metrics["n_pred_frame_coordinate_mismatches"] = int(
+        #    (
+        #        (
+        #            selected["pred_start"] - 1 + offset_nt
+        #        ) % 3 != selected["pred_frame"]
+        #    ).sum()
+        #)
+
+    # --------------------------------------------------
+    # 7. Return results
+    # --------------------------------------------------
+
+    return (
+        scored.drop(columns="_original_order"),
+        selected,
+        metrics
+    )
 
 def format_report(metrics: dict) -> str:
-    lines = ["ORF evaluation (closest candidate per reference gene)",
-             "Selection: min(|pred_start-ref_start| + |pred_end-ref_end|); tie-break: max IoU", ""]
+    lines = ["ORF evaluation (reference-guided closest candidate per gene)",
+             "Selection: minimum start + stop absolute errors; tie-break: maximum IoU", ""]
     for k, v in metrics.items():
-        lines.append(f"{k:26s} : {v:.4f}" if isinstance(v, (float, np.floating)) else f"{k:26s} : {v}")
+        lines.append(f"{k:38s} : {v:.4f}" if isinstance(v, (float, np.floating)) else f"{k:38s} : {v}")
     lines += ["", "Notes:",
-              "* exact_cds_recovery = exact matches / all reference genes (positive-set recall, NOT binary accuracy).",
-              "* mean_recall / mean_f1 / mean_iou include undetected genes as 0.",
-              "* mean_precision_detected and start/stop MAE exclude undetected genes.",
-              "* Coordinates are inclusive. Boundary MAE has nt units only if coordinate stride is 1 nt.",
-              "* Closest-candidate selection uses reference labels (oracle); not deployable Top-1 performance."]
-    return '\n'.join(lines) + '\n'
+              "- detection_rate = references with >=1 ORF / all reference records.",
+              "- mean_coverage_ref includes undetected references as zero.",
+              "- frame_accuracy = correct frame / detected references",
+              "- frame precision = correct frame / detected references.",
+              "- frame recall = correct frame / all references.",
+              "- frame per-class precision/recall/accuracy in frame_metrics.tsv.",
+              "- strict_orf_correct requires frame, exact start and exact end.",
+              "- Boundary MAE excludes undetected references; nt only at 1-nt stride.",
+              "- Region overlap metrics are k-mer-position-level.",
+              "- Closest candidate is reference-guided (oracle), not score-based Top-1."]
+    return "\n".join(lines) + "\n"
