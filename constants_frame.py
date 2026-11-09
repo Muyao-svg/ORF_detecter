@@ -2,8 +2,8 @@
 
 import numpy as np
 
-DATA_DIR= "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/data_i2bc"
-OUTPUT_DIR = "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Human_gene_110"
+DATA_DIR= "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/Benchmark"
+OUTPUT_DIR = "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Benchmark"
 
 #GENE_NAME = "RPS20"
 OFFSET = 12
@@ -16,6 +16,8 @@ LAMBDA_NO_STOP = 500
 BETA0 = -7.186061
 BETA1 = 4.105736
 BETA2 = 7.199081
+
+MAX_WORKERS = 4
 
 # =========================================================
 # Unified-frame HMM with explicit Start/C/Stop states

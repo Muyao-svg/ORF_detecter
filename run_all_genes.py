@@ -22,35 +22,27 @@ from viterbi import extract_orfs_from_viterbi, compute_orf_score
 
 
 def process_gene(task):
-    """在单个进程中处理一个 gene 的三个 frame。"""
+    """Fit all three reading frames independently for one gene."""
     gene_name, df_gene = task
-    print(f"\nProcessing gene {gene_name}...", flush=True)
-
     df_kmer = TripletData.add_k_idx_and_frame(
-        df_gene,
-        gene_name=gene_name,
-        offset_nt=OFFSET
+        df_gene, gene_name=gene_name, offset_nt=OFFSET
     )
     df_kmer = TripletData.add_start_type(df_kmer)
     df_kmer = TripletData.add_has_stop(df_kmer)
+    fit_parts, orf_parts = [], []
 
-    gene_hmm_results = []
-    gene_orf_results = []
+    for frame in (0, 1, 2):
+        print(f"Gene {gene_name}: running frame {frame}...", flush=True)
+        triplets = TripletData.build_sliding_triplets(df_kmer, offset=frame)
+        if triplets.empty:
+            print(f"  Gene {gene_name}, frame {frame}: no complete triplets", flush=True)
+            continue
+        triplets = TripletData.add_x1_range_score(triplets)
+        triplets = TripletData.add_x1_asin(triplets)
+        triplets["frame_run"] = frame
+        triplets = triplets.reset_index(drop=True)
 
-    for frame in [0, 1, 2]:
-        print(
-            f"  Gene {gene_name}: running frame {frame}...",
-            flush=True
-        )
-
-        df_triplet_fit = TripletData.build_sliding_triplets(
-            df_kmer, offset=frame
-        )
-        df_triplet_fit = TripletData.add_x1_range_score(df_triplet_fit)
-        df_triplet_fit = TripletData.add_x1_asin(df_triplet_fit)
-        df_triplet_fit["frame_run"] = frame
-        df_triplet_fit = df_triplet_fit.reset_index(drop=True)
-
+        # Each frame starts with independent emission/transition parameters.
         emission_model = EmissionModelFrame(
             state_params=copy.deepcopy(STATE_PARAMS),
             states=STATE_NAMES,
@@ -60,91 +52,62 @@ def process_gene(task):
             lambda_stop=LAMBDA_STOP,
             lambda_no_stop=LAMBDA_NO_STOP,
         )
-
-
-
-        p_start = StartLogitModel.compute_start_prob(
-            triplet_df=df_triplet_fit,
-            beta0=BETA0,
-            beta1=BETA1,
-            beta2=BETA2
-        )
-
-        transition_model_hmm = TransitionModelFrame(
+        transition_model = TransitionModelFrame(
             states=STATE_NAMES,
             A=A_INIT_HMM.copy(),
             pi0=PI0_INIT_HMM.copy(),
-            allowed_mask=ALLOWED_MASK.copy()
+            allowed_mask=ALLOWED_MASK.copy(),
         )
+        p_start = StartLogitModel.compute_start_prob(
+            triplet_df=triplets, beta0=BETA0, beta1=BETA1, beta2=BETA2
+        )
+        frame_run = triplets["frame_run"].to_numpy(dtype=int)
 
-        frame_run_vec = df_triplet_fit["frame_run"].to_numpy(dtype=int)
-
-        hmm_state_frame, hmm_loglik_trace = run_hmm_em_frame(
-            triplet_df=df_triplet_fit,
+        hmm_state, trace = run_hmm_em_frame(
+            triplet_df=triplets,
             emission_model=emission_model,
-            transition_model=transition_model_hmm,
+            transition_model=transition_model,
             p_start=p_start,
-            frame_run=frame_run_vec,
+            frame_run=frame_run,
             n_iter=20,
             tol=1e-4,
             update_mu=True,
+            update_r=True,
             update_pi=True,
             update_transition=True,
             pooled_transition=True,
             pseudocount=1e-6,
-            verbose=True
+            verbose=True,
         )
+        print(f"Gene {gene_name}, frame {frame} log-likelihood trace: {trace}", flush=True)
+        print(f"\nGene {gene_name} | Frame {frame}", flush=True)
+        emission_model.emission_parameter_summary()
 
-        print(
-            f"Gene {gene_name}, frame {frame} log-likelihood trace:",
-            hmm_loglik_trace,
-            flush=True
-        )
-
-        df_fit_hmm = df_triplet_fit.copy()
-        df_fit_hmm["Gene"] = gene_name
-        df_fit_hmm["state_hmm"] = [
-            STATE_NAMES[s] for s in hmm_state_frame.viterbi_path
-        ]
-        df_fit_hmm["p_start"] = p_start
-
+        fitted = triplets.copy()
+        fitted["Gene"] = gene_name
+        fitted["p_start"] = p_start
+        fitted["state_hmm"] = [STATE_NAMES[s] for s in hmm_state.viterbi_path]
         for i, state_name in enumerate(STATE_NAMES):
-            df_fit_hmm[f"gamma_{state_name}"] = (
-                hmm_state_frame.gamma[:, i]
-            )
+            fitted[f"gamma_{state_name}"] = hmm_state.gamma[:, i]
+        fit_parts.append(fitted)
 
-        gene_hmm_results.append(df_fit_hmm)
-
-        emission_logp_final = emission_model.build_emission_matrix(
-            df_triplet_fit
-        )
-
-        candidate_orfs = extract_orfs_from_viterbi(
-            triplet_df=df_fit_hmm,
-            hmm_state=hmm_state_frame,
+        emission_logp_final = emission_model.build_emission_matrix(triplets)
+        orfs = extract_orfs_from_viterbi(
+            triplet_df=fitted,
+            hmm_state=hmm_state,
             state_names=STATE_NAMES,
             emission_logp=emission_logp_final,
-            transition_model=transition_model_hmm,
+            transition_model=transition_model,
             p_start=p_start,
-            frame_run=frame_run_vec,
+            frame_run=frame_run,
             gene_name=gene_name,
         )
+        if not orfs.empty:
+            orf_parts.append(orfs)
+        print(f"  Gene {gene_name}, frame {frame}: {len(orfs)} candidate ORFs", flush=True)
 
-        if not candidate_orfs.empty:
-            print(
-                f"Gene {gene_name}, frame {frame}: "
-                f"found {len(candidate_orfs)} candidate ORFs.",
-                flush=True
-            )
-            gene_orf_results.append(candidate_orfs)
-        else:
-            print(
-                f"Gene {gene_name}, frame {frame}: "
-                "no candidate ORFs.",
-                flush=True
-            )
+    return gene_name, fit_parts, orf_parts
 
-    return gene_hmm_results, gene_orf_results
 
 
 def main():
@@ -190,11 +153,10 @@ def main():
     print(f"Processing {len(tasks)} genes with {max_workers} processes.")
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for gene_hmm_results, gene_orf_results in executor.map(
-            process_gene, tasks
-        ):
+        for gene_name,gene_hmm_results, gene_orf_results in executor.map(process_gene, tasks):
             all_df_fit_hmm.extend(gene_hmm_results)
             all_candidate_orfs.extend(gene_orf_results)
+            print("Finished gene:", gene_name)
 
     if all_df_fit_hmm:
         df_fit_hmm = pd.concat(all_df_fit_hmm, ignore_index=True)
@@ -202,20 +164,20 @@ def main():
         df_fit_hmm = pd.DataFrame(columns=["Gene"])
 
     if all_candidate_orfs:
-        candidate_orfs = pd.concat(
-            all_candidate_orfs, ignore_index=True
-        )
+        candidate_orfs = pd.concat(all_candidate_orfs, ignore_index=True)
     else:
         candidate_orfs = pd.DataFrame(columns=[
             "Gene", "frame",
             "triplet_start_idx", "triplet_end_idx",
             "k_start", "k_end",
             "n_triplets", "orf_score", "mean_orf_score",
-            "has_atg", "has_stop",
+            "has_canonical_start", "has_non_canonical_start", 
+            "has_stop",
         ])
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     df_fit_hmm.to_csv(
-        f"{OUTPUT_DIR}/hmm_fit_results_benchmarkset.txt",
+        f"{OUTPUT_DIR}/hmm_fit_results_v2.txt",
         index=False,
         sep="\t"
     )
@@ -224,7 +186,7 @@ def main():
     print(candidate_orfs)
 
     candidate_orfs.to_csv(
-        f"{OUTPUT_DIR}/candidate_orfs_benchmarkset.txt",
+        f"{OUTPUT_DIR}/candidate_orfs_v2.txt",
         index=False,
         sep="\t"
     )

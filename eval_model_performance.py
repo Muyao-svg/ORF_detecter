@@ -177,3 +177,4 @@ print("\n=== TIS localization (TOP-1 by orf_score) ===")
 print(f"Detection rate      : {top1['detected'].mean():.4f}")
 print(f"Exact TIS accuracy  : {top1['exact_hit'].mean():.4f}")
 print(f"Mean nt error (MAE) : {mean_nt_error:.2f} nt")
+# 我需要增加IoU
