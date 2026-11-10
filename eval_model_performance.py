@@ -1,6 +1,7 @@
 """Run evaluation for the 110 annotated genes; edit paths here as needed."""
 from pathlib import Path
 import pandas as pd
+import numpy as np
 from evaluate_metrics import (
     normalize_orfs, evaluate_orfs, frame_classification_metrics, format_report
 )
@@ -70,7 +71,10 @@ metric_cols = [
     "start_exact",
     "stop_exact",
     "exact_match",
+    "precision",
+    "recall",
     "iou",
+    "f1_score",
     "start_abs_error",
     "stop_abs_error"
 ]
@@ -105,50 +109,97 @@ print(summary)
 # Binary classification
 # ============================================================
 
-TP = int(positive["detected"].sum())
-FN = int((~positive["detected"]).sum())
-
-FP = int(negative["detected"].sum())
-TN = int((~negative["detected"]).sum())
-
-accuracy = (TP + TN) / (TP + TN + FP + FN)
-precision = (TP / (TP + FP) if TP + FP > 0 else 0)
-recall = ( TP / (TP + FN) if TP + FN > 0 else 0)
-specificity = (TN / (TN + FP) if TN + FP > 0 else 0)
-f1 = (2 * TP / (2 * TP + FP + FN) if 2 * TP + FP + FN > 0 else 0)
-
-print("\n--- Binary classification ---")
-print(f"TP: {TP}, FP: {FP}, TN: {TN}, FN: {FN}")
-print(f"Accuracy:    {accuracy:.4f}")
-print(f"Precision:   {precision:.4f}")
-print(f"Recall:      {recall:.4f}")
-print(f"Specificity: {specificity:.4f}")
-print(f"F1-score:   {f1:.4f}")
+#TP = int(positive["detected"].sum())
+#FN = int((~positive["detected"]).sum())
+#
+#FP = int(negative["detected"].sum())
+#TN = int((~negative["detected"]).sum())
+#
+#accuracy = (TP + TN) / (TP + TN + FP + FN)
+#precision = (TP / (TP + FP) if TP + FP > 0 else 0)
+#recall = ( TP / (TP + FN) if TP + FN > 0 else 0)
+#specificity = (TN / (TN + FP) if TN + FP > 0 else 0)
+#f1 = (2 * TP / (2 * TP + FP + FN) if 2 * TP + FP + FN > 0 else 0)
+#
+#print("\n--- Binary classification ---")
+#print(f"TP: {TP}, FP: {FP}, TN: {TN}, FN: {FN}")
+#print(f"Accuracy:    {accuracy:.4f}")
+#print(f"Precision:   {precision:.4f}")
+#print(f"Recall:      {recall:.4f}")
+#print(f"Specificity: {specificity:.4f}")
+#print(f"F1-score:   {f1:.4f}")
 
 # ============================================================
 # Positive group: ORF prediction quality
 # ============================================================
 
 print("\n--- Positive ORF quality ---")
+# Keep only positive fragments with selected ORFs
+positive_detected = positive[positive["detected"]].copy()
+
+n_positive = len(positive)
+n_detected = len(positive_detected)
 
 positive_metrics = {
-    "n_total": len(positive),
-    "n_detected": int(positive["detected"].sum()),
-    "detection_rate": positive["detected"].mean(),
-    "n_frame_correct": int(positive["frame_correct"].fillna(False).sum()),
-    "n_start_exact": int(positive["start_exact"].fillna(False).sum()),
-    "n_stop_exact": int(positive["stop_exact"].fillna(False).sum()),
-    "n_exact_cds": int(positive["exact_match"].fillna(False).sum()),
-    "mean_iou": positive["iou"].fillna(0).mean(),
-    "start_mae_detected": positive["start_abs_error"].mean(),
-    "stop_mae_detected": positive["stop_abs_error"].mean()
+    "n_total": n_positive,
+    "n_detected": n_detected,
+    "detection_rate": (
+        n_detected / n_positive if n_positive else np.nan
+    ),
+
+    # Frame
+    "n_frame_correct": int(
+        positive_detected["frame_correct"].fillna(False).sum()
+    ),
+
+    # Boundary accuracy
+    "n_start_exact": int(
+        positive_detected["start_exact"].fillna(False).sum()
+    ),
+
+    "n_stop_exact": int(
+        positive_detected["stop_exact"].fillna(False).sum()
+    ),
+
+    "n_exact_cds": int(
+        positive_detected["exact_match"].fillna(False).sum()
+    ),
+
+    # Interval-level metrics: selected ORFs only
+    "mean_precision": positive_detected["precision"].mean(),
+    "mean_recall": positive_detected["recall"].mean(),
+    "mean_iou": positive_detected["iou"].mean(),
+    "mean_f1": positive_detected["f1_score"].mean(),
+
+    # Boundary errors: selected ORFs only
+    "start_mae_detected": positive_detected["start_abs_error"].mean(),
+    "stop_mae_detected": positive_detected["stop_abs_error"].mean()
 }
 
-positive_metrics["frame_accuracy"] = (positive_metrics["n_frame_correct"] / positive["detected"].sum())
-positive_metrics["exact_cds_recovery"] = (positive_metrics["n_exact_cds"] / positive["detected"].sum())
+# Frame accuracy among detected positive fragments
+positive_metrics["frame_accuracy"] = (
+    positive_metrics["n_frame_correct"] / n_detected
+    if n_detected else np.nan
+)
+
+# Exact boundary rates among detected positive fragments
+positive_metrics["start_exact_rate"] = (
+    positive_metrics["n_start_exact"] / n_detected
+    if n_detected else np.nan
+)
+
+positive_metrics["stop_exact_rate"] = (
+    positive_metrics["n_stop_exact"] / n_detected
+    if n_detected else np.nan
+)
+
+positive_metrics["exact_cds_recovery"] = (
+    positive_metrics["n_exact_cds"] / n_detected
+    if n_detected else np.nan
+)
 
 for key, value in positive_metrics.items():
-    print(f"{key:25s}: {value:.4f}")
+    print(f"{key:28s}: {value:.4f}")
 
 # ============================================================
 # Negative group: False-positive detection
@@ -186,17 +237,17 @@ report_lines = [
     "========== Detection by Group ==========",
     summary.to_string(),
     "",
-    "========== Binary Classification ==========",
-    f"TP: {TP}",
-    f"FP: {FP}",
-    f"TN: {TN}",
-    f"FN: {FN}",
-    f"Accuracy:    {accuracy:.4f}",
-    f"Precision:   {precision:.4f}",
-    f"Recall:      {recall:.4f}",
-    f"Specificity: {specificity:.4f}",
-    f"F1-score:   {f1:.4f}",
-    "",
+  # "========== Binary Classification ==========",
+  # f"TP: {TP}",
+  # f"FP: {FP}",
+  # f"TN: {TN}",
+  # f"FN: {FN}",
+  # f"Accuracy:    {accuracy:.4f}",
+  # f"Precision:   {precision:.4f}",
+  # f"Recall:      {recall:.4f}",
+  # f"Specificity: {specificity:.4f}",
+  # f"F1-score:   {f1:.4f}",
+  # "",
     "========== Positive ORF Quality ==========",
 ]
 
