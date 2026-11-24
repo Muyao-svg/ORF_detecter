@@ -2,8 +2,8 @@
 
 import numpy as np
 
-DATA_DIR= "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/Benchmark"
-OUTPUT_DIR = "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Benchmark"
+DATA_DIR= "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/data_i2bc/KmersFromContigsQuerySum"
+OUTPUT_DIR = "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Human_gene_110/Singel_gene"
 
 #GENE_NAME = "RPS20"
 OFFSET = 12

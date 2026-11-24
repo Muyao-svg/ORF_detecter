@@ -17,7 +17,7 @@ from viterbi import extract_orfs_from_viterbi
 # MATRIC_DIR points to the input matrix file (not its parent folder).
 # =====================================================
 GENE = "RPS20"
-MATRIC_DIR = f"{DATA_DIR}/KmersFromContigsQuerySum"
+MATRIC_DIR = DATA_DIR
 OUT_DIR = OUTPUT_DIR
 
 
@@ -29,6 +29,7 @@ def process_gene(gene_name, df_gene):
     df_kmer = TripletData.add_start_type(df_kmer)
     df_kmer = TripletData.add_has_stop(df_kmer)
     fit_parts, orf_parts = [], []
+    pi_coding_by_frame = {}
 
     for frame in (0, 1, 2):
         print(f"Gene {gene_name}: running frame {frame}...", flush=True)
@@ -77,6 +78,12 @@ def process_gene(gene_name, df_gene):
             pseudocount=1e-6,
             verbose=True,
         )
+
+        # Save fitted coding multinomial probabilities
+        coding_state = f"C{frame}"
+        pi_coding_by_frame[frame] = (emission_model.state_params[coding_state]["pi_base"].copy())
+        print(f"Frame {frame} fitted pi_coding:",pi_coding_by_frame[frame])
+
         print(f"Frame {frame} log-likelihood trace: {trace}")
         fitted = triplets.copy()
         fitted["Gene"] = gene_name
@@ -106,13 +113,13 @@ def process_gene(gene_name, df_gene):
             orf_parts.append(orfs)
         print(f"  Frame {frame}: {len(orfs)} candidate ORFs")
 
-    return fit_parts, orf_parts
+    return fit_parts, orf_parts, pi_coding_by_frame
 
 
 def main():
     df = TripletData.load_kmer_table(str(MATRIC_DIR))
     df_gene = TripletData.subset_gene(df, GENE)
-    fit_parts, orf_parts = process_gene(GENE, df_gene)
+    fit_parts, orf_parts, pi_coding_by_frame = process_gene(GENE, df_gene)
     if not fit_parts:
         raise ValueError(f"No complete triplets available for gene {GENE}")
 
@@ -135,6 +142,31 @@ def main():
     orfs.to_csv(output_dir / f"candidate_orfs_{GENE}.txt", index=False, sep="\t")
     print(f"Finished {GENE}: {len(orfs)} candidate ORFs from three frames")
 
+    # Save fitted coding probabilities for each frame
+    pi_records = []
+
+    for frame, pi in pi_coding_by_frame.items():
+        pi_records.append({
+            "Gene": GENE,
+            "frame": frame,
+            "pi1": pi[0],
+            "pi2": pi[1],
+            "pi3": pi[2],
+        })
+
+    pi_df = pd.DataFrame(
+        pi_records,
+        columns=["Gene", "frame", "pi0", "pi1", "pi2"]
+    )
+
+    pi_df.to_csv(
+        output_dir / f"pi_coding_{GENE}.tsv",
+        sep="\t",
+        index=False
+    )
+
 
 if __name__ == "__main__":
     main()
+
+

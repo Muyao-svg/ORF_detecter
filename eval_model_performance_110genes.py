@@ -1,37 +1,52 @@
-# 打印前几行数据
-# 检查pred_ORF的基因是否在ref_ORF中
-# 检查是否所有基因都预测出了ORF
-# 对于拥有多个ORF的基因，采取距离ref_ORF最近的ORF作为预测结果
-# 计算CDS exact match的数量, accuracy, recall
-# 计算IoU, precision, F1 score
-# 计算start exact match的数量
-# 计算stop exact match的数量
-# 计算平均绝对误差（MAE）对于start和stop位置
-# 输出报告
 
 import pandas as pd
-import numpy as np
-import os
 from pathlib import Path
 
-from evaluate_metrics import *
+from evaluate_metrics import (
+    normalize_orfs,
+    evaluate_orfs,
+    frame_classification_metrics,
+    format_report
+)
 
+# ============================================================
+# 0. File paths
+# ============================================================
 
-# 0. Load data
+BASE = Path(
+    "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/"
+    "Ribokast_hmm/Segmentation_signal"
+)
+
+PRED_FILE = BASE / "Outputs/Human_gene_110/candidate_orfs_v2.txt"
+
+REF_FILE = (
+    BASE.parent / "Data/data_i2bc/110_gene_position_ref.txt"
+)
+
+OUT = BASE / "Outputs/Human_gene_110/Evaluation"
+OUT.mkdir(parents=True, exist_ok=True)
+
+OFFSET_NT = 12
+
+# ============================================================
+# 1. Load data
+# ============================================================
+
 print("Loading data...")
-pred_ORF = pd.read_csv("/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Segmentation_signal/Outputs/Human_gene_110/candidate_orfs_v2.txt", sep="\t")
-ref_ORF = pd.read_csv("/stockage/plateformes/I2BC/CBNG_Muyao-thesis/Ribokast_hmm/Data/data_i2bc/110_gene_position_ref.txt", sep="\s+")
 
-# 打印前几行数据
-print("Prediction ORF data:")
+pred_ORF = pd.read_csv(PRED_FILE, sep="\t")
+ref_ORF = pd.read_csv(REF_FILE, sep=r"\s+")
+
+print("\nPrediction ORFs:")
 print(pred_ORF.head())
-print("\nReference ORF data:")
+
+print("\nReference ORFs:")
 print(ref_ORF.head())
 
-
-# =====================================================
-# 1. Normalize ORF data
-# =====================================================
+# ============================================================
+# 2. Normalize ORF coordinates
+# ============================================================
 
 ref = normalize_orfs(
     ref_ORF,
@@ -46,85 +61,149 @@ pred = normalize_orfs(
     gene_col="Gene",
     start_col="k_start",
     end_col="k_end",
-    prefix="pred"
+    prefix="pred",
+    frame_col="frame"
 )
 
-# =====================================================
-# 2. Check genes
-# =====================================================
+# ============================================================
+# 3. Check reference and predicted genes
+# ============================================================
 
-pred_genes = set(pred["gene_name"])
 ref_genes = set(ref["gene_name"])
+pred_genes = set(pred["gene_name"])
 
 unknown_genes = pred_genes - ref_genes
 missing_genes = ref_genes - pred_genes
 
-print("\n=== Gene validation ===")
-print("Reference genes:", len(ref_genes))
-print("Predicted genes:", len(pred_genes))
+print("\n========== Gene Validation ==========")
 
-print("Predicted genes absent from reference:", unknown_genes)
-print("Reference genes without predictions:", missing_genes)
+print(f"Reference genes: {len(ref_genes)}")
+print(f"Predicted genes: {len(pred_genes)}")
+print(f"Unknown predicted genes: {len(unknown_genes)}")
+print(f"Genes without predictions: {len(missing_genes)}")
 
-# =====================================================
-# 3. Calculate evaluation metrics
-# =====================================================
+if unknown_genes:
+    print("Unknown genes:", sorted(unknown_genes))
 
-all_candidates, selected_orfs, metrics = evaluate_orfs(ref,pred)
+if missing_genes:
+    print("Missing genes:", sorted(missing_genes))
 
-# evaluate_orfs automatically:
-# 1. Scores all candidate ORFs
-# 2. Selects closest ORF to reference per gene
-# 3. Calculates exact matches, Recall, F1, IoU, MAE
-# 4. Includes genes without predictions
+# evaluate_orfs requires predictions to exist in reference
+pred = pred.loc[
+    pred["gene_name"].isin(ref_genes)
+].copy()
 
-# =====================================================
-# 4. Print results
-# =====================================================
+# ============================================================
+# 4. Evaluate ORFs
+# ============================================================
 
-print("\n=== ORF evaluation ===")
-
-print("Exact CDS matches:", metrics["n_exact_cds"])
-print("Exact CDS recovery:", metrics["exact_cds_recovery"])
-
-print("Mean Recall:", metrics["mean_recall"])
-print("Mean Precision:", metrics["mean_precision_detected"])
-print("Mean F1-score:", metrics["mean_f1"])
-print("Mean IoU:", metrics["mean_iou"])
-
-print("Start exact matches:", metrics["n_start_exact"])
-print("Stop exact matches:", metrics["n_stop_exact"])
-
-print("Start MAE (nt):", metrics["start_mae_detected"])
-print("Stop MAE (nt):", metrics["stop_mae_detected"])
-
-# =====================================================
-# 5. Save results
-# =====================================================
-
-OUT = Path(
-    "/stockage/plateformes/I2BC/CBNG_Muyao-thesis/"
-    "Ribokast_hmm/Segmentation_signal/Outputs/"
-    "Human_gene_110/Evaluation"
+all_candidates, selected, metrics = evaluate_orfs(
+    ref,
+    pred,
+    offset_nt=OFFSET_NT
 )
 
-OUT.mkdir(parents=True, exist_ok=True)
+# ============================================================
+# 5. Frame classification
+# ============================================================
 
-# 所有预测的ORF及其评分, recall, precision, F1, IoU, MAE
+frame_table = pd.DataFrame()
+
+if "pred_frame" in selected.columns:
+    frame_table, frame_metrics = (
+        frame_classification_metrics(selected)
+    )
+
+# ============================================================
+# 6. Print results
+# ============================================================
+
+print("\n========== ORF Detection ==========")
+
+print(f"Reference genes: {metrics['n_reference']}")
+print(f"Detected genes: {metrics['n_detected']}")
+print(f"Undetected genes: {metrics['n_undetected']}")
+print(f"Detection rate: {metrics['detection_rate']:.4f}")
+
+print("\n========== ORF Quality ==========")
+
+print(
+    f"Mean precision: "
+    f"{metrics['mean_precision_detected']:.4f}"
+)
+
+print(
+    f"Mean recall: "
+    f"{metrics['mean_recall_detected']:.4f}"
+)
+
+print(
+    f"Mean F1: "
+    f"{metrics['mean_f1_detected']:.4f}"
+)
+
+print(
+    f"Mean IoU: "
+    f"{metrics['mean_iou_detected']:.4f}"
+)
+
+print("\n========== Boundary Accuracy ==========")
+
+print(
+    f"Start exact rate: "
+    f"{metrics['start_exact_rate_detected']:.4f}"
+)
+
+print(
+    f"Stop exact rate: "
+    f"{metrics['stop_exact_rate_detected']:.4f}"
+)
+
+print(
+    f"Exact CDS rate: "
+    f"{metrics['exact_cds_rate_detected']:.4f}"
+)
+
+print(
+    f"Start MAE: "
+    f"{metrics['start_mae_detected']:.4f}"
+)
+
+print(
+    f"Stop MAE: "
+    f"{metrics['stop_mae_detected']:.4f}"
+)
+
+print("\n========== Frame Accuracy ==========")
+
+if "frame_accuracy" in metrics:
+    print(
+        f"Frame accuracy: "
+        f"{metrics['frame_accuracy']:.4f}"
+    )
+
+    print("\nPer-frame classification:")
+    print(frame_table)
+
+# ============================================================
+# 7. Save results
+# ============================================================
+
+# All candidate ORFs with evaluation scores
 all_candidates.to_csv(
     OUT / "all_candidate_scores.tsv",
     sep="\t",
     index=False
 )
 
-# 最接近参考ORF的预测ORF
-selected_orfs.to_csv(
+# Best matching ORF per gene
+selected.to_csv(
     OUT / "selected_orfs.tsv",
     sep="\t",
     index=False
 )
 
-# 评估指标
+# All summary metrics
 pd.DataFrame(
     list(metrics.items()),
     columns=["metric", "value"]
@@ -134,10 +213,22 @@ pd.DataFrame(
     index=False
 )
 
+# Frame classification
+if not frame_table.empty:
+    frame_table.to_csv(
+        OUT / "frame_metrics.tsv",
+        sep="\t",
+        index=False
+    )
+
+# Text report
 report = format_report(metrics)
 
-with open(OUT / "evaluation_report.txt", "w") as f:
-    f.write(report)
+(OUT / "evaluation_report.txt").write_text(
+    report,
+    encoding="utf-8"
+)
 
-print("\nEvaluation completed.")
+print("\n========== Evaluation Completed ==========")
+print(report)
 print("Results saved to:", OUT)

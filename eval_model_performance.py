@@ -23,8 +23,24 @@ if 'frame' not in pred_ORF.columns:
 print('Prediction ORFs:\n', pred_ORF.head())
 print('Reference ORFs:\n', ref_ORF.head())
 
+# Benchmark dataset parameter
+OFFSET = 12
+FRAGMENT_LENGTH = 100
+KMER_SIZE = 25
+MAX_KMER_IDX = FRAGMENT_LENGTH - KMER_SIZE + 1
+
+ref_ORF = ref_ORF.copy()
+ref_ORF["true_frame"]=(ref_ORF["cds_start_kmer"] - 1 + OFFSET) % 3
+is_tis = ref_ORF["category"] == "TIS"
+is_cds = ref_ORF["category"] == "CDS"
+# kmer index: 1 bases
+ref_ORF.loc[is_tis, "cds_end_kmer"] = MAX_KMER_IDX
+ref_ORF.loc[is_cds, ["cds_start_kmer", "cds_end_kmer"]] = [1, MAX_KMER_IDX]
+
+
 # 1. Normalize the ORFs to have the same column names and formats
 ref = normalize_orfs(ref_ORF, 'gene_name', 'cds_start_kmer', 'cds_end_kmer', 'ref')
+ref["true_frame"] = ref_ORF["true_frame"].to_numpy()
 pred = normalize_orfs(pred_ORF, 'Gene', 'k_start', 'k_end', 'pred', frame_col='frame')
 
 print('Unknown predicted genes:', sorted(set(pred.gene_name) - set(ref.gene_name)))

@@ -131,9 +131,14 @@ def evaluate_orfs(ref: pd.DataFrame,pred: pd.DataFrame,offset_nt: int = 12) -> t
     # --------------------------------------------------
     # 1. Calculate true reading frame
     # --------------------------------------------------
-
     reference = ref.copy()
-    reference["true_frame"] = ((reference["ref_start"] - 1 + offset_nt) % 3).astype(int)
+
+    # Only calculate frame if it was not provided
+    if "true_frame" not in reference.columns:
+        reference["true_frame"] = (
+            (reference["ref_start"] - 1 + offset_nt) % 3
+        ).astype(int)
+
     
     # --------------------------------------------------
     # 2. Score all candidate ORFs
