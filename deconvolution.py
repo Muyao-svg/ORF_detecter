@@ -18,7 +18,7 @@ EPS = 1e-12
 
 def background_vector(background, K):
     """
-    还未详细展开构建background，此处background=1用作测试
+    ❓ The background has not yet been implemented in detail; here, `background=1` is used for testing!!!!
     """
     b = np.broadcast_to(np.asarray(background, dtype=float), (K,)).copy()
     if not np.all(np.isfinite(b)) or np.any(b <= 0):
@@ -35,7 +35,10 @@ def poisson_loglik(Y, mu):
 
 
 def fit_activity_poisson(Y, A, background=1.0):
-    """Joint nonnegative Poisson MLE for all candidate ORF activities."""
+    """Joint nonnegative Poisson MLE for all candidate ORF activities.
+    Y: raw counts
+    A: design matrix
+    """
     Y, A = np.asarray(Y, float), np.asarray(A, float)
     if A.ndim != 2 or Y.shape != (A.shape[0],):
         raise ValueError("Expected Y (K,) and A (K,J)")
@@ -47,10 +50,10 @@ def fit_activity_poisson(Y, A, background=1.0):
         return np.zeros(0)
     x0 = np.full(J, max(float(Y.mean() - b.mean()), 0) / max(J, 1))
     x0 /= np.maximum(A.mean(axis=0), EPS)
-    def fun(beta):
+    def fun(beta): # Negative Poisson Log-Likelihood
         mu = b + A @ beta
         return float(np.sum(mu - Y * np.log(mu)))
-    def jac(beta):
+    def jac(beta): # gradient
         mu = b + A @ beta
         return A.T @ (1 - Y / mu)
     result = minimize(fun, x0, jac=jac, method="L-BFGS-B",
@@ -67,6 +70,10 @@ def build_A_matrix(k_indices, candidate_orfs, pi_coding_by_frame):
     frame in the current run_single_gene.py is a sliding-triplet *row offset*,
     not necessarily the absolute P-site phase. This assumes contiguous k_idx
     across each predicted ORF (as the HMM triplet builder does).
+
+    k_indice:1,2,3...k
+    candidate_orfs: ORFs predicted by HMM
+    pi_coding_by_frame: pi estimated by HMM
     """
     k = np.asarray(k_indices, dtype=int)
     if k.ndim != 1 or len(np.unique(k)) != len(k):
@@ -82,15 +89,22 @@ def build_A_matrix(k_indices, candidate_orfs, pi_coding_by_frame):
         if not len(segment) or len(segment) != end - start + 1 or segment[0] != start:
             raise ValueError(f"Missing k-mer indices in ORF [{start}, {end}]")
         A[mask, j] = pi[(segment - start) % 3]
+        # for example:
+        # segment = [4,5,6,7,8,9], so start = 4
+        # segment - start = [0,1,2,3,4,5]
+        # (segment - start) % 3 = [0,1,2,0,1,2]
+        # pi[(segment - start) % 3] corresponding to the pi_0, pi_1, pi_2 estimated by HMM
     return A
 
 
 
 def make_residual_dataframe(df_gene, k_indices, Y, A_selected, beta):
-    """Return a copy with 'sum' replaced by rounded/clipped residual counts.
+    """
+    Return a copy with 'sum' replaced by clipped residual counts.
+    df_gene MUST already be sorted with k_idx matching k_indices
 
-    df_gene MUST already be sorted with k_idx matching k_indices; this check
-    prevents accidentally subtracting activity at the wrong position.
+    df_gene: ["kmer_id", "sequence","sum_counts".....]
+    Y = df_gene["sum_counts"]
     """
     k = np.asarray(k_indices, dtype=int)
     Y = np.asarray(Y, float)
@@ -118,16 +132,17 @@ def evaluate_candidate_orfs(Y, k_indices, candidates, selected_orfs,
 
     Returns (best_or_none, trials_df), where best includes A, beta, mu,
     loglik, bic. Does not decide whether the BIC improvement is sufficient.
-    pi_fix用的是第一次hmm估计的参数，固定这个参数为了简化逻辑，之后修改!!!!!!!!!!!!!!!!!!!!!!!!!!
-    pi_fix--> pi_coding_by_frame???????
+    ❓pi_fix uses the parameters estimated by the first HMM. These parameters are fixed to simplify the logic, but will be modified later!!!!!!!!!!!!!!!!!!!!!!!!!!
+    ❓pi_fix --> pi_coding_by_frame???????
     """
     Y = np.asarray(Y, float)
     K = len(Y)
     b = background_vector(background, K)
-    # 去掉重复ORFs
+    # Remove duplicate ORFs
     selected_keys = {orf_key(row) for _, row in selected_orfs.iterrows()}
-    # 如果当前HMM预测的ORF已经被之前的迭代接受，就跳过；
-    # 如果同一个ORF在候选中重复出现，保留orf_score更高的记录
+
+    # If the ORF predicted by the current HMM has already been accepted in a previous iteration, skip it;
+    # If the same ORF appears multiple times among the candidates, keep the entry with the higher orf_score
     unique = {}
     for _, row in candidates.iterrows():
         key = orf_key(row)
@@ -143,25 +158,26 @@ def evaluate_candidate_orfs(Y, k_indices, candidates, selected_orfs,
             records.append(trial_info)
             continue
         try:
-            #构建新的A_matrix，包含之前已经评估过的ORF和新加入的ORF
+            #Construct a new A_matrix that includes both previously evaluated ORFs and newly added ORFs
             a_new = build_A_matrix(k_indices, pd.DataFrame([row]), pi_fixed)
         except ValueError:
             trial_info["status"] = "invalid_A"
             records.append(trial_info)
             continue
-        A_trial = np.column_stack((A_selected, a_new))  # 将HMM新预测的ORF与之前已经通过测试的ORF放一起构成新A_matrix
-        beta_trial = fit_activity_poisson(Y, A_trial, b) # 根据新的A估计beta
+        # Combine the ORFs newly predicted by the HMM with the ORFs that have already passed testing to form a new A_matrix.
+        A_trial = np.column_stack((A_selected, a_new))  
+        beta_trial = fit_activity_poisson(Y, A_trial, b) # Estimate beta based on the new A
         mu = b + A_trial @ beta_trial
         ll = poisson_loglik(Y, mu)
-        bic = -2 * ll + A_trial.shape[1] * np.log(K)   # 计算BIC
+        bic = -2 * ll + A_trial.shape[1] * np.log(K)   # Compute BIC
         trial_info.update({"beta_new": beta_trial[-1], "loglik": ll,
                            "BIC": bic, "status": "evaluated"})
         records.append(trial_info)
-        # 如果ORF beta 小于阈值，则认为没有贡献
+        # If the ORF beta is less than the threshold, it is considered to make no contribution.
         if beta_trial[-1] <= min_activity:
             trial_info["status"] = "negligible_activity"
             continue
-        # 选择BIC最低的candidate ORF
+        # ❓ Select the candidate ORF with the lowest BIC. Need improve: Perhaps can select multiple ORF at once?
         if best is None or bic < best["BIC"]:
             best = {"row": row, "A": A_trial, "beta": beta_trial,
                     "mu": mu, "loglik": ll, "BIC": bic, "key": key}

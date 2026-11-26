@@ -48,7 +48,9 @@ PRINT_FULL_A = True
 
 
 def process_gene(gene_name, df_gene):
-    """Run existing independent three-frame HMM; return fitted params as well."""
+    """Run existing independent three-frame HMM; return fitted params as well.
+    HMM part
+    """
     df_kmer = TripletData.add_k_idx_and_frame(
         df_gene, gene_name=gene_name, offset_nt=OFFSET)
     df_kmer = TripletData.add_start_type(df_kmer)
@@ -124,6 +126,9 @@ def process_gene(gene_name, df_gene):
 
 
 def detect_orfs(gene_name, df_counts, round_index, output_dir):
+    """
+    HMM part, these ORFs will be used in deconvolution model.Not the final results
+    """
     fit_parts, orf_parts, pi, hmm_params = process_gene(gene_name, df_counts)
     candidates = pd.concat(orf_parts, ignore_index=True) if orf_parts else pd.DataFrame(
         columns=["Gene", "frame", "k_start", "k_end", "orf_score"])
@@ -162,7 +167,8 @@ def iterative_orf_discovery(gene_name, df_gene, output_dir,
     stop_reason = "max_iter"
 
 
-    #这里待修改，循环次数不应该由人为指定，应该是BIC 提升小于某个值时停止！！！！！！！！
+    #❓ This needs to be revised—the number of iterations should not be specified manually; 
+    # ❓ the loop should stop when the BIC improvement falls below a certain value!!!!!!!!!!
     for rnd in range(1, max_iter + 1):
         print(f"\n{'='*65}\nROUND {rnd}: {'ORIGINAL' if rnd == 1 else 'RESIDUAL'} counts\n{'='*65}")
         df_input = (df_original.copy() if rnd == 1 else
@@ -173,15 +179,15 @@ def iterative_orf_discovery(gene_name, df_gene, output_dir,
         if fixed_pi is None:
             fixed_pi = {int(f): np.asarray(p, float).copy() for f, p in pi_this_round.items()}
             print(f"[Deconvolution] fixed original-data coding pi: {fixed_pi}")
-        # 这一轮进入BIC测试的候选ORF(hmm预测的ORF)
-        # 选择BIC最低的
-        # ！！！！！一开始hmm是没有overlapping的，可以直接一次性保留三个！！！ 要修改！！！
+        # ❓ORF candidates (ORFs predicted by HMM) entering the BIC test in this round
+        #❓ Select the one with the lowest BIC
+        # ❓!!!!! Initially, the HMM did not allow for overlapping; can directly keep three at once!!! This needs to be fixed!!!
         best, trials = evaluate_candidate_orfs(
             Y, k_indices, candidates, selected, A_selected, beta,
             fixed_pi, background=b, min_activity=MIN_ACTIVITY)
         trials.to_csv(output_dir / f"round_{rnd}_trials_{gene_name}.tsv", sep="\t", index=False)
         print(f"[Model selection] all trials:\n{trials.to_string(index=False)}")
-        # 如果BIC提升小于阈值，则停止循环
+        # If the BIC increase is less than the threshold, stop the loop.
         if best is None or previous_bic - best["BIC"] <= MIN_BIC_IMPROVEMENT:
             stop_reason = "no_candidates" if candidates.empty else "no_bic_improvement"
             print(f"[STOP] {stop_reason}; J={len(beta)}, BIC={previous_bic:.6f}")
@@ -189,7 +195,7 @@ def iterative_orf_discovery(gene_name, df_gene, output_dir,
                             "BIC": previous_bic, "status": stop_reason})
             break
 
-        # 更新参数
+        # Update BIC, A
         old_bic = previous_bic
         selected = pd.concat((selected, pd.DataFrame([best["row"]])), ignore_index=True)
         A_selected, beta = best["A"], best["beta"]
