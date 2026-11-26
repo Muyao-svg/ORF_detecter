@@ -8,8 +8,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 from data import TripletData
 from constants_frame import *
-from emission_frame import EmissionModelFrame
-from frame_em import *
+from Ribokast_hmm.Segmentation_signal.New_ribohmm.emission import EmissionModelFrame
+from Ribokast_hmm.Segmentation_signal.New_ribohmm.EM import *
 from logistic import StartLogitModel
 from transition_frame import TransitionModelFrame
 from frame_hmm import (
